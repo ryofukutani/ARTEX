@@ -1,0 +1,18 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 18 * * *'   # 毎日 03:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync main with BaaRai/ARTEX
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh repo sync "$GITHUB_REPOSITORY" --source BaaRai/ARTEX --branch main

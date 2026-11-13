@@ -385,6 +385,9 @@ export const api = {
       tested: number;
       pct: number | null;
       by_type: { type: string; total: number; tested: number }[];
+      // coverage ledger (absent when the feature is off): gaps = open items; an unexamined class is never clean
+      gaps?: { kind: string; surface?: string; risk_area: string }[];
+      completeness?: { complete: boolean; state: string; caveat: string };
     }>(`/tasks/${id}/coverage`),
   // Asset coverage graph: every in-scope asset + root-domain/company nodes used for connection, with tested/in_scope.
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
@@ -1229,6 +1232,9 @@ export const api = {
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
+  // No body: the server derives the rule from the stored request, which stays pending.
+  interceptAlwaysAllow: (id: number) =>
+    post<{ rule: InterceptRule; created: boolean }>(`/intercept/pending/${id}/always-allow`),
   interceptExecution: (id: number, conversationId?: number) =>
     get<import("@/lib/types").InterceptExecution>(
       `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,

@@ -958,6 +958,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
 	mux.HandleFunc("POST /api/intercept/pending/{id}/decide", s.interceptDecide)
+	mux.HandleFunc("POST /api/intercept/pending/{id}/always-allow", s.interceptAlwaysAllow) // creates an argv allow rule; the request stays pending
 	mux.HandleFunc("GET /api/intercept/history", s.interceptHistory)
 	mux.HandleFunc("GET /api/intercept/history/{id}", s.interceptDetail)
 	mux.HandleFunc("GET /api/intercept/history/{id}/execution", s.interceptExecution)
@@ -1939,10 +1940,16 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	cov, err := as.TaskCoverageWithSources(taskID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		log.Printf("[coverage] coverage query failed for task %d: %v", taskID, err)
+		writeErr(w, 500, "coverage query failed")
 		return
 	}
 	cov.Enabled = true
+	if cov.CoverageLedger, err = as.CoverageLedger(taskID); err != nil {
+		log.Printf("[coverage] ledger query failed for task %d: %v", taskID, err)
+		writeErr(w, 500, "coverage ledger query failed")
+		return
+	}
 	writeJSON(w, 200, cov)
 }
 
@@ -4067,9 +4074,14 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			counts[ty] = len(ns)
 		}
 	}
+	var ledger *db.CoverageLedger
+	if t.CoverageEnabled {
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		ledger, _ = s.m.Assets().CoverageLedger(taskID)
+	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		AssetCounts: counts, Findings: findings, Coverage: ledger,
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

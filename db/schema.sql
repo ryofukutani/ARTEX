@@ -1076,7 +1076,7 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     enabled         BOOLEAN NOT NULL DEFAULT true,
     priority        INTEGER NOT NULL DEFAULT 0,
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
-    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex')),
+    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex', 'argv')),
     pattern         TEXT NOT NULL,
     action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask')),
     message         TEXT NOT NULL DEFAULT '',
@@ -1086,6 +1086,10 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Allow argv prefix rules on databases created before them (pattern = JSON array of tokens).
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_match_type_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_match_type_check
+    CHECK (match_type IN ('string','regex','argv'));
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1435,7 +1439,7 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     -- dingtalk DingTalk / feishu Feishu (Lark) / wecom WeCom (WeChat Work) / webhook generic / telegram / email
     kind         TEXT NOT NULL,
     enabled      BOOLEAN NOT NULL DEFAULT true,
-    -- Credentials (stored in plaintext, masked when echoed to the UI; see maskChannelSecrets on the server side).
+    -- Credentials (encrypted at rest by db/secrets.go, masked when echoed to the UI; see notify.MaskConfig).
     -- The six channel kinds differ wildly in fields, so one JSONB column + strict per-kind validation on the Go
     -- side avoids a pile of NULL columns per channel:
     --   dingtalk {webhook,secret}
@@ -1568,3 +1572,39 @@ CREATE TABLE IF NOT EXISTS rsi_lesson_usage (
     shown_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (lesson_id, task_id, mode)
 );
+
+-- Coverage ledger (agent_reported layer, see db/coverage_ledger.go): what a worker
+-- examined, ruled out or left open, per (task, surface, risk_area). One current row
+-- per key; every write is also appended to coverage_ledger_history. A risk class with
+-- no row is unexamined, never clean. Rows exist only for tasks with coverage_enabled.
+CREATE TABLE IF NOT EXISTS coverage_ledger (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,  -- stored lower-case, matched against goal vulnclass
+    outcome     TEXT NOT NULL
+                CHECK (outcome IN ('reported','no_issue_found','ruled_out','not_applicable','needs_follow_up')),
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, surface, risk_area)
+);
+CREATE TABLE IF NOT EXISTS coverage_ledger_history (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_coverage_ledger_history_task ON coverage_ledger_history(task_id, id);
+-- Why the current run ended ('' = normal, 'budget' = run-budget wrap-up). Per run:
+-- written with the guarded terminal status, cleared when the task moves back to a
+-- non-terminal state (revive), so an earlier run's reason never marks a later one.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT '';

@@ -52,6 +52,14 @@ AI autonomous penetration testing system (Go backend + Next.js frontend)
 The global "Approval Records", the in-task "Interception Approvals", and the approval cards in conversations all support expanding to view details. The display structure references the
 [AegisHook approval details component](https://github.com/RuoJi6/AegisHook/blob/main/web/src/components/CallDetail.vue), reusing ARTEX's components and theme:
 
+## Argv prefix rules
+
+Besides `string` and `regex`, an interception rule can use `match_type: argv` (Bash only, `match_target: tool_input`). Its pattern is a JSON array of 1 to 8 tokens, for example `["git","push"]`, with no empty token, no token starting with `-` and no shell metacharacter or space.
+
+- **It is a prefix rule.** The command is parsed (mvdan.cc/sh, Bash grammar, as the Bash tool runs `bash -c`) and must be one simple command: no pipe, list (`;`, `&&`, `||`), redirection, prefix assignment, subshell, background job, no wrapper program (`command`, `builtin`, `env`, `exec`, `eval`), and no command or process substitution or parameter expansion anywhere. Its prefix (program plus subcommands, from a code-owned arity table: `git push`, `npm run build`, `nmap`) must equal the pattern exactly. Any other form does not match, and the normal flow (judge, approval) continues.
+- **Flags are ignored by construction.** `["git","push"]` also covers `git push --force`; a flag before the subcommand (`git -C /repo push`) matches nothing. An allowed prefix does not cover what the program does internally.
+- An argv rule takes its place in the priority order like any rule, and the target gate still runs after an argv allow.
+
 
 ## Traffic capture browser extension
 
@@ -173,6 +181,14 @@ gunzip -c backups/artex-db-<timestamp>.sql.gz | docker compose exec -T postgres 
   psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
 ```
 
+Stored secrets (LLM API keys, MCP env, task credentials, notification channel
+config) are encrypted in the database with the key in `keys/secret.key`
+(generated at first start, mode 0600, next to `jwt.key`). **A database backup
+without that key can no longer restore those secrets**: back up `keys/` with the
+dump, separately. Deployments without a persistent disk set `ARTEX_SECRET_KEY`
+(32 bytes, base64 or hex, e.g. `openssl rand -base64 32`) instead. ARTEX refuses
+to start when the database holds encrypted secrets and no key is available.
+
 Daily cron example (03:20, operator crontab):
 
 ```
@@ -265,6 +281,8 @@ Optional: `ARTEX_LLM_PROVIDER` (anthropic | openai | openai-responses | ollama) 
 **Untrusted-output boundary (on by default)**: tool results for the worker, planner, chat and main agent are framed between nonce-tagged markers so the model treats them as data, not instructions. Unset or empty, the boundary is on; set `ARTEX_UNTRUSTED_BOUNDARY=0` (or `false` / `off` / `no`) to disable it. Measured cost: about 154 bytes per tool result plus one system note.
 
 **Noise profile (off by default)**: `ARTEX_NOISE_PROFILE` paces the requests ARTEX itself sends to targets (WebFetch, http custom tools, the enrich probe). Unset or `off`, nothing changes: no limit, no cache. Set `quiet` (2 req/s per host, burst 4, 1 in flight), `balanced` (5 req/s, burst 10, 2 in flight) or `aggressive` (20 req/s, burst 40, 4 in flight), e.g. `ARTEX_NOISE_PROFILE=balanced` in `.env` or the environment. A profile also adds a small jitter, backs off on 429/503 (honouring `Retry-After`, bounded retries, GET/HEAD/OPTIONS only), and, for the http custom tools and the enrich probe, merges identical in-flight GETs of one task (per tool) and caches them briefly (60/30/10 s; never POST, PUT, PATCH or DELETE; WebFetch is paced only), and logs a per-host noise line each minute. `ARTEX_TARGET_USER_AGENT` sets a User-Agent on target requests that carry none, under a profile; empty keeps the current one. Tools launched through Bash are not paced yet.
+
+**Low-and-slow agent guidance (off by default)**: when a noise profile is set, the planner, worker, main agent and chat agents receive a code-owned prompt block with the profile's per-host limits and exact rate/delay flags for the scanners installed in the image (`nmap`, `nuclei`, `httpx`, `katana`, `ffuf`, `dalfox`, `sqlmap`). It tells them to test one host at a time, to back off on 429/503 and never to raise the rate to meet a deadline. Unset or `off`, the block is empty and every prompt is unchanged. Commands launched through Bash are not paced by the governor, so these flags are the brake for scanners.
 
 **Run budgets (off by default)**: `ARTEX_TASK_BUDGET_TOKENS` and `ARTEX_TASK_BUDGET_TURNS` cap a task's total spend (its planner rounds and all its workers); `ARTEX_INTENT_BUDGET_TOKENS` and `ARTEX_INTENT_BUDGET_TURNS` cap one worker run. Unset or `0` means unlimited, and nothing changes. A worker is not started when the remaining task budget cannot cover its estimated cost (the average of the task's finished workers, else 50000 tokens and 10 turns). When the remaining budget reaches the wrap-up reserve (the larger of 5% and 20000 tokens, and 2 turns), the task enters a forced wrap-up: the planner writes a summary and the final goal judgment, and workers may only write back (`record_fact`, `insert_assets`, `report_finding`, `update_finding_report`). The task then ends `done` if its goals are met, otherwise `timeout`. Budgets are kept in memory: a restart, or a revive of a finished task, starts a fresh budget. Each planner round logs a `[budget]` line. Practical floor: below 50000 tokens a task gets no worker; from 50000 to about 70000 it typically gets one worker and then the wrap-up. Pick a budget well above 70000 tokens for real exploration.
 

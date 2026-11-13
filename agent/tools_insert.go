@@ -668,6 +668,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// avoid reporting the same finding twice.
 		t.listFindings(),
 		t.addFinding(), t.recordFact(),
+		// coverage ledger (coverage-only: dropped when coverage_enabled=false).
+		t.recordCoverage(),
 		// asset management (handlers guard nil store internally).
 		// add_company_scope is not given to workers: defining a company's asset scope is
 		// the duty of planning/main-control/Auto; a worker only executes exploration.
@@ -675,6 +677,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// bbot output by path: in-scope assets via insert_assets, the rest as
 		// third_party_intel facts (never auto-scoped).
 		t.ingestBbot(),
+		// scanner output (nmap -oX) by path, without the raw output.
+		t.ingestScanOutput(),
 		// Task credentials (#3): reuse user-declared test accounts, record
 		// self-registered ones so they are not forgotten.
 		t.saveTaskCredential(), t.listTaskCredentials(),

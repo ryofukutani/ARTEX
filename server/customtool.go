@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,10 +18,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/notify"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -51,7 +54,7 @@ func (s *Server) pgCreateCustomTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req customToolReq
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -70,6 +73,11 @@ func (s *Server) pgCreateCustomTool(w http.ResponseWriter, r *http.Request) {
 	}
 	if exist, _ := pg.GetTool(req.Key); exist != nil {
 		writeErr(w, 409, "this key already exists (built-in or custom tool)")
+		return
+	}
+	var err error
+	if req.Exec, err = unmaskToolExec("", nil, req.Kind, req.Exec); err != nil { // nothing stored: a placeholder is refused
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if err := pg.CreateCustomTool(&db.Tool{
@@ -98,7 +106,7 @@ func (s *Server) pgUpdateCustomTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req customToolReq
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -108,6 +116,10 @@ func (s *Server) pgUpdateCustomTool(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Kind == "http" && !hasSchemaProps(req.Schema) {
 		writeErr(w, 400, "http tools must provide a parameter JSON Schema (cannot be left empty)")
+		return
+	}
+	if req.Exec, err = unmaskToolExec(existing.Kind, existing.Exec, req.Kind, req.Exec); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if err := pg.UpdateCustomTool(&db.Tool{
@@ -138,6 +150,7 @@ func (s *Server) pgDeleteCustomTool(w http.ResponseWriter, r *http.Request) {
 // real tool call — it runs arbitrary command/script/http on the server, which the
 // custom-tool feature already allows, so no new capability is granted.
 type testToolReq struct {
+	Key    string          `json:"key"`  // the saved tool being edited, if any: its stored values replace placeholders
 	Kind   string          `json:"kind"` // command | script | http
 	Exec   json.RawMessage `json:"exec"`
 	Params map[string]any  `json:"params"`
@@ -154,6 +167,23 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 	var req testToolReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid request body")
+		return
+	}
+	var storedKind string
+	var stored json.RawMessage
+	if req.Key != "" {
+		t, err := pg.GetTool(req.Key)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if t != nil && !t.System {
+			storedKind, stored = t.Kind, t.Exec
+		}
+	}
+	var err error
+	if req.Exec, err = unmaskToolExec(storedKind, stored, req.Kind, req.Exec); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	params := req.Params
@@ -234,6 +264,86 @@ type httpExec struct {
 	TimeoutMs         int               `json:"timeout_ms"`
 	Proxy             string            `json:"proxy"`
 	UseRecordingProxy bool              `json:"use_recording_proxy"`
+}
+
+// toolExecFlags are the response-only *_set flags of maskToolExec; never stored.
+var toolExecFlags = []string{"headers_set", "proxy_set", "body_set"}
+
+// maskToolExec is what the API shows of a custom tool's exec: every header value,
+// the proxy and the body become the placeholder, each with a *_set flag.
+func maskToolExec(raw json.RawMessage) json.RawMessage {
+	var e map[string]any
+	if json.Unmarshal(raw, &e) != nil || e == nil {
+		return raw
+	}
+	if h, ok := e["headers"].(map[string]any); ok {
+		set := false
+		for k, v := range h {
+			if v != "" {
+				h[k], set = notify.MaskedPrefix, true
+			}
+		}
+		e["headers_set"] = set
+	}
+	for _, k := range []string{"proxy", "body"} {
+		if s, ok := e[k].(string); ok {
+			e[k], e[k+"_set"] = maskedSecret(s), s != ""
+		}
+	}
+	out, _ := json.Marshal(e)
+	return out
+}
+
+// unmaskToolExec puts the stored value back for every header, proxy or body sent
+// as the placeholder, so a client echoing the list response keeps the stored
+// secret; an explicit value replaces it and "" clears it. A placeholder with
+// nothing stored to keep (stored nil on create) is refused. As for the MCP env,
+// a stored secret is only kept for the destination it was configured for: when
+// the url (exact string) or the kind changes, a placeholder is refused.
+func unmaskToolExec(storedKind string, stored json.RawMessage, kind string, in json.RawMessage) (json.RawMessage, error) {
+	var e, old map[string]any
+	if json.Unmarshal(in, &e) != nil || e == nil {
+		return in, nil // not an object: stored or refused as before
+	}
+	_ = json.Unmarshal(stored, &old)
+	changed, kept := false, false
+	for _, k := range toolExecFlags {
+		if _, ok := e[k]; ok {
+			delete(e, k)
+			changed = true
+		}
+	}
+	oldHeaders, _ := old["headers"].(map[string]any)
+	headers, _ := e["headers"].(map[string]any)
+	for k, v := range headers {
+		if s, ok := v.(string); !ok || !isMaskedSecret(s) {
+			continue
+		}
+		prev, ok := oldHeaders[k]
+		if !ok {
+			return nil, fmt.Errorf("header %q: masked value but nothing stored to keep", k)
+		}
+		headers[k], changed, kept = prev, true, true
+	}
+	for _, k := range []string{"proxy", "body"} {
+		if s, ok := e[k].(string); !ok || !isMaskedSecret(s) {
+			continue
+		}
+		prev, _ := old[k].(string)
+		if prev == "" {
+			return nil, fmt.Errorf("%s: masked value but nothing stored to keep", k)
+		}
+		e[k], changed, kept = prev, true, true
+	}
+	oldURL, _ := old["url"].(string)
+	newURL, _ := e["url"].(string)
+	if kept && (oldURL != newURL || storedKind != kind) {
+		return nil, fmt.Errorf("destination changed (url or kind) while a stored secret was kept: re-enter the masked header/proxy/body or clear it; stored secrets are not sent to a new destination")
+	}
+	if !changed {
+		return in, nil
+	}
+	return json.Marshal(e)
 }
 
 func timeoutOr(ms, def int) time.Duration {
@@ -374,7 +484,7 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 		}
 		sessionEnv = tc.Env
 	}
-	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, timeoutOr(spec.TimeoutMs, 120000))
+	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, timeoutOr(spec.TimeoutMs, 120000), s.execPriv)
 	if err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
@@ -384,9 +494,17 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 // execPython writes the code to a temp .py under workDir/.tools, runs it via interp
 // with the params JSON on stdin + scalar params mirrored to TOOL_<NAME> env, and
 // returns combined stdout+stderr (with a timeout/exit note). Standalone + testable.
-func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration) (string, error) {
+// When agent processes run as the executor, the script goes to priv.ScriptDir
+// instead: the executor can write workDir, so it could make workDir/.tools a
+// symlink and have the server, which is root, create and chown a file through it.
+func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration, priv ExecPrivilege) (string, error) {
 	toolsDir := filepath.Join(workDir, ".tools")
-	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
+	if priv.Enabled {
+		if priv.ScriptDir == "" {
+			return "", errors.New("the executor script directory is not prepared")
+		}
+		toolsDir = priv.ScriptDir
+	} else if err := os.MkdirAll(toolsDir, 0o755); err != nil {
 		return "", err
 	}
 	f, err := os.CreateTemp(toolsDir, key+"-*.py")
@@ -400,17 +518,22 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 		return "", err
 	}
 	f.Close()
+	if err := prepareExecScript(priv, tmp); err != nil {
+		return "", err
+	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := exec.CommandContext(runCtx, interp, tmp)
 	c.Dir = workDir
-	c.Env = append(os.Environ(), sessionEnv...) // session proxy env
-	for k, v := range params {                  // scalar params mirrored as TOOL_<NAME>
+	// The allowlist as the executor (execenv_unix.go), then the session proxy env.
+	c.Env = append(agentProcessEnv(priv), sessionEnv...)
+	for k, v := range params { // scalar params mirrored as TOOL_<NAME>
 		if sv, ok := scalarStr(v); ok {
 			c.Env = append(c.Env, "TOOL_"+strings.ToUpper(k)+"="+sv)
 		}
 	}
+	applyExecCredential(c, priv) // after c.Env: it sets the executor's HOME there
 	pj, _ := json.Marshal(params)
 	c.Stdin = bytes.NewReader(pj) // parameter JSON goes via stdin
 	out, err := c.CombinedOutput()
@@ -458,13 +581,17 @@ func (s *Server) runHTTPTool(ctx context.Context, key string, execRaw json.RawMe
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
 	// Every redirect hop goes through the target gate, as the rendered URL did.
 	client.CheckRedirect = intercept.RedirectCheck(key)
-	// The shared egress governor paces every request and redirect hop per host
-	// under the noise profile (off by default: the base transport itself).
+	if intercept.ApplyAssessmentUserAgent(req) {
+		client.CheckRedirect = assessmentRedirectCheck(client.CheckRedirect)
+	}
+	// The current egress governor paces every request and redirect hop per host
+	// under the noise profile (off by default: the base transport itself). It is
+	// resolved per request, so a changed profile applies to the next call.
 	var base http.RoundTripper = http.DefaultTransport
 	if tr := s.httpToolTransport(ctx, key, spec); tr != nil {
 		base = tr
 	}
-	client.Transport = egress.Shared().Transport(key, base)
+	client.Transport = egress.Current().Transport(key, base)
 	resp, err := client.Do(req)
 	if err != nil {
 		return actool.Errorf("request failed: " + err.Error()), nil
@@ -474,6 +601,19 @@ func (s *Server) runHTTPTool(ctx context.Context, key string, execRaw json.RawMe
 	out := map[string]any{"status": resp.StatusCode, "body": string(respBody)}
 	b, _ := json.Marshal(out)
 	return actool.Text(actool.Capture(tc, string(b))), nil
+}
+
+// assessmentRedirectCheck sheds the generated identifier on the first redirect
+// to another origin. net/http copies headers from the initial request for each
+// hop, so check the previous hop to keep the identifier off after that point.
+func assessmentRedirectCheck(check func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		previous := via[len(via)-1]
+		if previous.Header.Get("User-Agent") == "" || !config.SameAssessmentOrigin(previous.URL, req.URL) {
+			req.Header.Del("User-Agent")
+		}
+		return check(req, via)
+	}
 }
 
 // httpToolTransport is the transport of one http tool call, or nil
@@ -506,9 +646,11 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	proxyStr := proxyURLString(spec.Proxy)
 	var caFile string
 	if spec.UseRecordingProxy {
-		if addr := proxyURLString(s.m.ProxyAddr()); addr != "" {
+		if tr := s.m.Traffic(); tr != nil && s.m.TrafficEnabled() {
+			proxyStr = proxyURLString(tr.ProxyAddr())
+			caFile = tr.CACertPath()
+		} else if addr := proxyURLString(s.m.GlobalProxy()); addr != "" {
 			proxyStr = addr
-			caFile = s.m.ProxyCACert()
 		}
 	}
 	if proxyStr == "" {
@@ -520,6 +662,8 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	}
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}
 	if caFile != "" {
+		// Keep recorded HTTP requests on separate connections across redirects.
+		tr.DisableKeepAlives = true
 		if pem, err := os.ReadFile(caFile); err == nil {
 			pool := x509.NewCertPool()
 			if pool.AppendCertsFromPEM(pem) {

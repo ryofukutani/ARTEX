@@ -98,12 +98,16 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			if strings.TrimSpace(a.Description) == "" {
 				return actool.Errorf("description is required"), nil
 			}
-			path := filepath.Join(s.skillDir, a.Name)
-			if _, err := os.Stat(path); err == nil {
+			dirCP, err := resolveSkillDir(s.skillDir, a.Name)
+			if err != nil {
+				return actool.Errorf("invalid skill path"), nil
+			}
+			if dirCP.exists {
 				return actool.Errorf("skill already exists: " + a.Name), nil
 			}
+			path := filepath.Join(s.skillDir, a.Name)
 			if err := os.MkdirAll(path, 0o755); err != nil {
-				return actool.Errorf(err.Error()), nil
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			var b strings.Builder
 			b.WriteString("---\n")
@@ -117,7 +121,7 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			}
 			if err := os.WriteFile(filepath.Join(path, "SKILL.md"), []byte(b.String()), 0o644); err != nil {
 				_ = os.RemoveAll(path)
-				return actool.Errorf(err.Error()), nil
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			return actool.Text("skill created: " + a.Name), nil
 		})
@@ -137,10 +141,6 @@ func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 			if !validSkillName(a.Name) {
 				return actool.Errorf("invalid skill name"), nil
 			}
-			skillPath := filepath.Join(s.skillDir, a.Name)
-			if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-				return actool.Errorf("skill does not exist: " + a.Name), nil
-			}
 			rel := strings.TrimSpace(a.File)
 			if rel == "" {
 				rel = "SKILL.md"
@@ -149,12 +149,21 @@ func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 			if msg != "" {
 				return actool.Errorf("illegal path: " + msg), nil
 			}
-			full := filepath.Join(skillPath, clean)
-			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-				return actool.Errorf(err.Error()), nil
+			skillExists, cp, err := resolveSkillFile(s.skillDir, a.Name, clean)
+			if err != nil {
+				return actool.Errorf("illegal path: invalid path"), nil
 			}
-			if err := os.WriteFile(full, []byte(a.Content), 0o644); err != nil {
-				return actool.Errorf(err.Error()), nil
+			if !skillExists {
+				return actool.Errorf("skill does not exist: " + a.Name), nil
+			}
+			if cp.realPath == cp.realRoot {
+				return actool.Errorf("illegal path: invalid path"), nil
+			}
+			if err := os.MkdirAll(filepath.Dir(cp.realPath), 0o755); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			if err := os.WriteFile(cp.realPath, []byte(a.Content), 0o644); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			return actool.Text("skill file written: " + a.Name + "/" + clean), nil
 		})
@@ -216,6 +225,10 @@ func (s *Server) toolCreateCustomTool() actool.CoreTool {
 			if exist, _ := s.m.pg.GetTool(a.Key); exist != nil {
 				return actool.Errorf("this key already exists: " + a.Key), nil
 			}
+			var err error
+			if a.Exec, err = unmaskToolExec("", nil, a.Kind, a.Exec); err != nil { // nothing stored: a placeholder is refused
+				return actool.Errorf(err.Error()), nil
+			}
 			if err := s.m.pg.CreateCustomTool(toDBTool(a)); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -238,6 +251,10 @@ func (s *Server) toolUpdateCustomTool() actool.CoreTool {
 			}
 			if a.Kind == "http" && !hasSchemaProps(a.Schema) {
 				return actool.Errorf("http tools must provide a parameter JSON Schema (cannot be empty)"), nil
+			}
+			var err error
+			if a.Exec, err = unmaskToolExec(existing.Kind, existing.Exec, a.Kind, a.Exec); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			if err := s.m.pg.UpdateCustomTool(toDBTool(a)); err != nil {
 				return actool.Errorf(err.Error()), nil

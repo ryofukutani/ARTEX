@@ -11,7 +11,7 @@ import (
 	"crypto/tls"
 	"html"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -75,7 +75,7 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 		Timeout:       4 * time.Second,
 	})
 	if err != nil {
-		log.Printf("[enrich] dnsx init failed, DNS resolution disabled: %v", err)
+		slog.Warn("[enrich] dnsx init failed, DNS resolution disabled", "err", err)
 		resolv = nil
 	}
 	e := &Engine{
@@ -99,7 +99,8 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 // probe without a scope is refused. When the scope's gate is on, the probe
 // connects to the target itself, without the proxy, so that the dialer decides
 // on the target and connects only to the addresses a pin covers. Every request
-// goes through the shared egress governor (the noise profile; off by default).
+// goes through the egress governor current at that request (the noise profile;
+// off by default), so a changed profile applies without rebuilding the client.
 func buildClient(proxy func() string) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
@@ -120,7 +121,7 @@ func buildClient(proxy func() string) *http.Client {
 		}
 	}
 	return &http.Client{
-		Transport: egress.Shared().Transport("enrich", tr),
+		Transport: egress.Dynamic("enrich", tr),
 		Timeout:   httpTimeout,
 		// cap redirects; keep them within scope by re-checking at probe time
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -145,7 +146,7 @@ func (e *Engine) enqueue(j job) {
 	select {
 	case e.jobs <- j:
 	default: // queue full → drop (best-effort enrichment)
-		log.Printf("[enrich] queue full, dropping job kind=%d id=%d", j.kind, j.id)
+		slog.Warn("[enrich] enrich queue full, dropping job", "kind", j.kind, "id", j.id)
 	}
 }
 
@@ -247,6 +248,7 @@ func (e *Engine) doHTTP(ctx context.Context, id int64, rawURL string) {
 	if err != nil {
 		return
 	}
+	intercept.ApplyAssessmentUserAgent(req)
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return
@@ -278,20 +280,6 @@ func hostOf(rawURL string) string {
 		return ""
 	}
 	return u.Hostname()
-}
-
-func isBlank(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return true
-	case string:
-		return x == ""
-	case float64:
-		return x == 0
-	case int:
-		return x == 0
-	}
-	return false
 }
 
 func uniq(in []string) []string {

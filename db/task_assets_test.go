@@ -10,15 +10,16 @@ import (
 func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	task, err := d.CreateTask("manual scope registration", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "task", d.DeleteTask(task.ID)) })
 	suffix := time.Now().UnixNano()
 	domain := fmt.Sprintf("manual-scope-%d.example.test", suffix)
 	ip := fmt.Sprintf("203.0.%d.%d", (suffix/250)%250, suffix%250+1)
@@ -48,7 +49,10 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 			t.Fatalf("unexpected task asset provenance: %+v", asset)
 		}
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs(assetIDs) })
+	t.Cleanup(func() {
+		_, err := d.Assets().DeleteByIDs(assetIDs)
+		cleanupErr(t, "assets", err)
+	})
 	scopes, err := d.Assets().ListTaskScope(task.ID)
 	if err != nil || len(scopes) != 5 {
 		t.Fatalf("task scope=%+v err=%v", scopes, err)
@@ -89,20 +93,24 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	task, err := d.CreateTask("asset editing", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "task", d.DeleteTask(task.ID)) })
 	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("manual-%d.example.test", time.Now().UnixNano())})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() {
+		_, err := d.Assets().DeleteByIDs([]int64{assetID})
+		cleanupErr(t, "asset", err)
+	})
 
 	mutation, err := d.Assets().AttachAssetsToTask(task.ID, []int64{assetID, assetID}, "authorized asset list item 3")
 	if err != nil {
@@ -142,9 +150,10 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	source, err := d.CreateTask("source assets", "goal", nil, 0, 0)
 	if err != nil {
@@ -154,15 +163,25 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(current.ID); _ = d.DeleteTask(source.ID) })
+	t.Cleanup(func() {
+		cleanupErr(t, "current task", d.DeleteTask(current.ID))
+		cleanupErr(t, "source task", d.DeleteTask(source.ID))
+	})
 
+	intentHost := fmt.Sprintf("intent-%d.example.test", time.Now().UnixNano())
 	assetID, err := d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{
-		URL: fmt.Sprintf("https://intent-%d.example.test", time.Now().UnixNano()), TaskID: source.ID,
+		URL: "https://" + intentHost, TaskID: source.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() {
+		_, err := d.Assets().DeleteByIDs([]int64{assetID})
+		cleanupErr(t, "asset", err)
+		// UpsertHTTPService also creates the parent subdomain and root_domain rows.
+		_, err = d.Exec(`DELETE FROM assets WHERE domain IN ($1, 'example.test')`, intentHost)
+		cleanupErr(t, "parent assets", err)
+	})
 	intentID, err := d.Exploration(source.ExplorationID).AddIntent(map[string]any{"summary": "source worker"}, 5, []int64{assetID}, "planner")
 	if err != nil {
 		t.Fatal(err)

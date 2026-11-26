@@ -31,6 +31,7 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 	return db.FindingFilter{
 		Severity:           normFilter(q.Get("severity")),
 		Status:             normFilter(q.Get("status")),
+		ReportState:        normFilter(q.Get("report_state")),
 		VerificationStatus: normFilter(q.Get("verification_status")),
 		VulnClass:          normFilter(q.Get("vulnclass")),
 		// task_id (independent of the task param, which switches to the per-task-node branch): filters the global table by task.
@@ -38,6 +39,8 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Query:      q.Get("q"),
 		Sort:       q.Get("sort"),
 		AssetScope: strings.TrimSpace(q.Get("asset_scope")),
+		// company is the sidebar switcher; it also narrows the asset tree.
+		Company: strings.TrimSpace(q.Get("company")),
 	}
 }
 

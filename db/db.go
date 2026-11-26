@@ -1,6 +1,15 @@
 // Package db is the PostgreSQL data source for ARTEX (replacing the old graph
 // single-file SQLite). It opens the connection, applies the schema, and seeds
 // the built-in agents and variable catalog.
+//
+// Schema changes:
+//   - schema.sql remains the idempotent base, executed on every startup.
+//   - Any new DDL goes in a numbered migration, migrations/NNNN_slug.sql.
+//     Open applies pending migrations once, in version order, and records
+//     each in schema_migrations with the SHA-256 of its file.
+//   - A published migration is never edited: Open refuses to start when an
+//     applied migration's checksum no longer matches its file. Fix forward
+//     with a new migration instead.
 package db
 
 import (
@@ -9,12 +18,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
 )
@@ -91,8 +102,9 @@ func coordinateWithSchemaMigration(tx *sql.Tx) error {
 }
 
 // DSN resolves the PostgreSQL connection string and reports where it came from.
-// Precedence: env ARTEX_PG_DSN > config file (config.json). There is no
-// built-in default — it errors if neither source is configured.
+// Precedence: env ARTEX_PG_DSN > ARTEX_PG_HOST/USER/PASSWORD/DBNAME > config
+// file (config.json). There is no built-in default — it errors if no source
+// is configured.
 func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
 }
@@ -146,15 +158,30 @@ func ensureDatabase(dsn string) error {
 	var exists bool
 	_ = admin.QueryRow(`SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
 	if !exists {
-		if _, err := admin.Exec(`CREATE DATABASE "` + dbName + `"`); err != nil {
+		if _, err := admin.Exec(createDatabaseSQL(dbName)); err != nil {
 			return fmt.Errorf("create database %q: %w", dbName, err)
 		}
 	}
 	return nil
 }
 
-// Open connects, applies the schema (idempotent), and seeds builtin rows.
+// createDatabaseSQL builds the CREATE DATABASE statement for a DSN-supplied
+// database name. pgx.Identifier quotes it and doubles any embedded quote, so
+// the name cannot close the identifier, and names PostgreSQL accepts but a
+// restrictive allowlist would reject (hyphens, dots, non-ASCII) keep working.
+func createDatabaseSQL(name string) string {
+	return "CREATE DATABASE " + pgx.Identifier{name}.Sanitize()
+}
+
+// Open connects, applies the schema (idempotent) and the embedded versioned
+// migrations, and seeds builtin rows.
 func Open(dsn string) (*DB, error) {
+	return openWithMigrations(dsn, migrationsFS())
+}
+
+// openWithMigrations is Open with the migration set as a parameter, so tests
+// can pass an fstest.MapFS.
+func openWithMigrations(dsn string, migrations fs.FS) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
 		return nil, err
 	}
@@ -186,6 +213,11 @@ func Open(dsn string) (*DB, error) {
 	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
 		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
+		}
+		// Runs on conn, the lock holder; it must not call EnsureLLM*Table,
+		// whose own lock request would wait on conn forever.
+		if err := applyMigrations(context.Background(), conn, migrations); err != nil {
+			return fmt.Errorf("apply migrations: %w", err)
 		}
 		if err := d.seedBuiltins(); err != nil {
 			return fmt.Errorf("seed builtins: %w", err)
@@ -295,12 +327,20 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 	// the recording proxy + CA at runtime (server.Manager.syncBrowserMCPProxy).
 	// Insert only if absent so we never clobber user edits (args/env/enabled/
 	// visibility) on restart.
+	// Launched through the installed playwright-mcp binary, not `npx
+	// @playwright/mcp`: npx asks the npm registry on every start, even with the
+	// package installed globally, so the version that runs is the registry's.
+	// --browser chromium: the default is the "chrome" channel (Google Chrome),
+	// which the image does not have; it ships Playwright's Chromium.
 	if _, err := d.Exec(`
 INSERT INTO mcp_servers(name, transport, command, args, env, enabled)
-VALUES ('browser', 'stdio', 'npx', $1, '{}', false)
+VALUES ('browser', 'stdio', $1, $2, '{}', false)
 ON CONFLICT (name) DO NOTHING`,
-		`["@playwright/mcp","--headless"]`); err != nil {
+		browserMCPCommand, browserMCPSeedArgs); err != nil {
 		return fmt.Errorf("seed browser mcp: %w", err)
+	}
+	if err := d.migrateStockBrowserMCP(); err != nil {
+		return fmt.Errorf("migrate browser mcp: %w", err)
 	}
 	// NOTE: the placeholder ScopeSentry data-source MCP (empty URL + empty X-API-Key,
 	// disabled) is seeded directly in schema.sql §F so a raw `psql < schema.sql` init
@@ -310,6 +350,9 @@ ON CONFLICT (name) DO NOTHING`,
 	}
 	if err := d.seedDefaultInterceptRules(); err != nil {
 		return fmt.Errorf("seed intercept rules: %w", err)
+	}
+	if err := d.seedPersistenceApprovalRules(); err != nil {
+		return fmt.Errorf("seed persistence approval rules: %w", err)
 	}
 	if err := d.seedDefaultInterceptRulesV2(); err != nil {
 		return fmt.Errorf("seed intercept rules v2: %w", err)
@@ -369,6 +412,12 @@ var builtinSkillVisibility = map[string][]string{
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
 // agents. Insert-if-absent (ON CONFLICT DO NOTHING) so a user's later toggle-off is
 // never resurrected on restart — matches the browser-MCP / intercept-rule seed policy.
+//
+// This only holds while toggle-off keeps the row: ToggleSkillVisibility and
+// SetAgentSkillVisibility write enabled=false rather than DELETE, so "explicitly
+// off" is distinguishable from "never seeded". Deleting a skill is the one path
+// that removes rows (DeleteSkillVisibility), which is what lets a re-installed
+// skill be seeded again.
 func (d *DB) seedBuiltinSkillVisibility() error {
 	for skillName, agentKeys := range builtinSkillVisibility {
 		for _, key := range agentKeys {

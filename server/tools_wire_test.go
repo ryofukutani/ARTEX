@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 func names(tools []actool.CoreTool) map[string]actool.CoreTool {
@@ -24,16 +24,16 @@ func names(tools []actool.CoreTool) map[string]actool.CoreTool {
 func TestWireTools(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer pg.Close()
 
 	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
-	t.Cleanup(func() { agent.ToolResolve = nil })
+	t.Cleanup(func() { agent.SetToolResolve(nil) })
 	// Prevent interactive-shell Bash decoration: if the worker agent has
 	// interactive_shell=true in the DB, ToolResolve would append a note to
 	// Bash's description. Disable that for this test so the undecorated
@@ -52,7 +52,7 @@ func TestWireTools(t *testing.T) {
 	base := append(ts.WorkerTools(), actool.DefaultTools()...)
 	ctx := context.Background()
 
-	worker := names(agent.ToolResolve(ctx, "worker", base))
+	worker := names(agent.ToolResolve()(ctx, "worker", base))
 	if _, ok := worker["record_fact"]; !ok {
 		t.Error("worker lost record_fact")
 	}
@@ -65,7 +65,7 @@ func TestWireTools(t *testing.T) {
 		t.Error("Bash should pass through undecorated, but description changed")
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
-	planner := names(agent.ToolResolve(ctx, "planner", base))
+	planner := names(agent.ToolResolve()(ctx, "planner", base))
 	if _, ok := planner["record_fact"]; ok {
 		t.Error("planner should not get record_fact (not bound)")
 	}
@@ -73,19 +73,26 @@ func TestWireTools(t *testing.T) {
 	// Edit description + add a default to a scalar param, then confirm the resolved
 	// worker tool reflects both. Restore from code default on cleanup.
 	t.Cleanup(func() { _ = pg.UpsertToolForce(rf.Key, rf.Description, rf.Schema, mustJSON(rf.Agents)) })
+	// Facts-only contract: the fact fields, and so the
+	// editable scalar annotations, live on the facts[] items.
 	var schema map[string]any
 	_ = json.Unmarshal(rf.Schema, &schema)
-	if props, ok := schema["properties"].(map[string]any); ok {
-		if conf, ok := props["confidence"].(map[string]any); ok {
-			conf["default"] = "inferred"
-		}
+	itemProps := func(sc map[string]any) map[string]any {
+		props, _ := sc["properties"].(map[string]any)
+		facts, _ := props["facts"].(map[string]any)
+		items, _ := facts["items"].(map[string]any)
+		ip, _ := items["properties"].(map[string]any)
+		return ip
+	}
+	if conf, ok := itemProps(schema)["confidence"].(map[string]any); ok {
+		conf["default"] = "inferred"
 	}
 	edited := mustJSON(schema)
 	if err := pg.UpdateTool(rf.Key, "EDITED DESC", edited, mustJSON([]string{"worker"}), true); err != nil {
 		t.Fatal(err)
 	}
 
-	worker2 := names(agent.ToolResolve(ctx, "worker", base))
+	worker2 := names(agent.ToolResolve()(ctx, "worker", base))
 	got := worker2["record_fact"]
 	if got == nil {
 		t.Fatal("record_fact missing after edit")
@@ -96,9 +103,8 @@ func TestWireTools(t *testing.T) {
 	// Default injection: omit confidence → handler input should carry the default.
 	// We can't run the real handler (nil store), but InputSchema must show the default.
 	sc := got.InputSchema()
-	props := sc["properties"].(map[string]any)
-	conf := props["confidence"].(map[string]any)
-	if conf["default"] != "inferred" {
+	conf, _ := itemProps(sc)["confidence"].(map[string]any)
+	if conf == nil || conf["default"] != "inferred" {
 		t.Errorf("confidence.default = %v, want inferred", conf["default"])
 	}
 }
@@ -109,11 +115,11 @@ func TestWireTools(t *testing.T) {
 func TestHealListTaskCredentialsSchema(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { pg.Close() })
 	s := &Server{m: &Manager{pg: pg}}

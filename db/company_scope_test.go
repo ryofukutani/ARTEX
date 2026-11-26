@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 )
@@ -21,6 +22,14 @@ func TestParseScopeLine(t *testing.T) {
 		{"co.uk", "", true}, // bare public suffix
 		{"not a host", "", true},
 		{"1.2.3.1-1.2.3.9", "", true}, // ranges must be CIDR
+		{"*.example.com", "domain", false},
+		{"https://*.example.co.uk/path", "domain", false},
+		{"*.api.example.com", "", true}, // no rule covers only a subdomain's subdomains
+		{"*.co.uk", "", true},
+		{"*.com", "", true},
+		{"*.1.2.3.4", "", true},
+		{"api.*.example.com", "", true},
+		{"*example.com", "", true},
 	}
 	for _, c := range cases {
 		r, err := ParseScopeLine(c.in)
@@ -76,6 +85,11 @@ func TestParseAutoScopeLine(t *testing.T) {
 		{name: "overbroad cidr", input: "10.0.0.0/8", wantErr: true},
 		{name: "bare suffix", input: "co.uk", wantErr: true},
 		{name: "empty domain label", input: "foo..example.com", wantErr: true},
+		{name: "wildcard domain", input: "*.example.com", kind: "domain", normalized: "example.com"},
+		{name: "wildcard url", input: "https://*.Example.com:8443/", kind: "domain", normalized: "example.com"},
+		{name: "wildcard idn", input: "*.bücher.de", kind: "domain", normalized: "xn--bcher-kva.de"},
+		{name: "wildcard subdomain", input: "*.api.example.com", wantErr: true},
+		{name: "wildcard suffix", input: "*.co.uk", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,7 +246,7 @@ func TestParseStructuredCompanyScope(t *testing.T) {
 func TestCompanyICPAttribution(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	// Closing the connection must go through t.Cleanup and be **registered before
 	// the data cleanup**: t.Cleanup is last-in-first-out, so registering Close
@@ -321,7 +335,7 @@ func TestCompanyICPAttribution(t *testing.T) {
 func TestCompanyScopeAttribution(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	as := d.Assets()
 	cs := d.Companies()
@@ -331,19 +345,36 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		d.Close()
 		t.Fatalf("startMax: %v", err)
 	}
+	// Remove everything the test creates, or the next pass on the same database
+	// finds this company's scope and attributes its assets to it. Assets first
+	// (they reference the company), then the company; its scope rows cascade.
+	var cid int64
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE id > $1`, startMax)
-		d.Close()
+		defer d.Close()
+		if _, err := d.Exec(`DELETE FROM assets WHERE id > $1`, startMax); err != nil {
+			t.Errorf("cleanup assets: %v", err)
+		}
+		if cid != 0 {
+			if _, err := d.Exec(`DELETE FROM companies WHERE id = $1`, cid); err != nil {
+				t.Errorf("cleanup company %d: %v", cid, err)
+			}
+		}
 	})
 
-	uniq := startMax + 1
-	root := fmt.Sprintf("scopetest%d.com", uniq)
+	// Unique per run: MAX(assets.id) comes back to the same value after cleanup,
+	// so it cannot tell one pass from the next. The in-scope /24 is picked per
+	// run from 198.18.0.0/15 so a scope left by an interrupted run cannot claim
+	// this run's IP.
+	uniq := fmt.Sprintf("%d%d", time.Now().UnixNano(), rand.Uint32())
+	n := rand.IntN(512)
+	cidr := fmt.Sprintf("198.%d.%d.0/24", 18+n/256, n%256)
+	root := fmt.Sprintf("scopetest%s.com", uniq)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
+	ipIn := fmt.Sprintf("198.%d.%d.9", 18+n/256, n%256)
 	ipOut := "203.0.113.9"
-	outDomain := fmt.Sprintf("other%d.net", uniq)
+	outDomain := fmt.Sprintf("other%s.net", uniq)
 
-	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
+	cid, _, err = cs.UpsertCompany(fmt.Sprintf("ScopeCo %s", uniq), "")
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
@@ -359,7 +390,7 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	cs.AddScope(cid, []string{root, cidr}, "unit test")
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64
@@ -407,4 +438,59 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("UpsertIP out: %v", err)
 	}
 	mustNil(ipOutID, "out-of-CIDR ip")
+}
+
+// A "*.example.com" line is stored as the example.com domain rule, so it
+// attributes the subdomains just as a plain example.com line does.
+func TestCompanyScopeWildcardAttribution(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	as := d.Assets()
+	cs := d.Companies()
+
+	var startMax int64
+	if err := d.QueryRow(`SELECT COALESCE(MAX(id),0) FROM assets`).Scan(&startMax); err != nil {
+		d.Close()
+		t.Fatalf("startMax: %v", err)
+	}
+	var cid int64
+	t.Cleanup(func() {
+		defer d.Close()
+		if _, err := d.Exec(`DELETE FROM assets WHERE id > $1`, startMax); err != nil {
+			t.Errorf("cleanup assets: %v", err)
+		}
+		if cid != 0 {
+			if _, err := d.Exec(`DELETE FROM companies WHERE id = $1`, cid); err != nil {
+				t.Errorf("cleanup company %d: %v", cid, err)
+			}
+		}
+	})
+
+	uniq := fmt.Sprintf("%d%d", time.Now().UnixNano(), rand.Uint32())
+	root := fmt.Sprintf("wildcardtest%s.com", uniq)
+	cid, _, err = cs.UpsertCompany(fmt.Sprintf("WildcardCo %s", uniq), "")
+	if err != nil {
+		t.Fatalf("UpsertCompany: %v", err)
+	}
+	cs.AddScope(cid, []string{"*." + root}, "unit test")
+
+	var domain string
+	if err := d.QueryRow(`SELECT domain FROM company_scope WHERE company_id = $1 AND kind = 'domain'`, cid).Scan(&domain); err != nil {
+		t.Fatalf("read scope: %v", err)
+	}
+	if domain != root {
+		t.Fatalf("stored domain = %q, want %q", domain, root)
+	}
+
+	id, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: "api." + root})
+	if err != nil {
+		t.Fatalf("UpsertSubdomain: %v", err)
+	}
+	var got *int64
+	d.QueryRow(`SELECT company_id FROM assets WHERE id = $1`, id).Scan(&got)
+	if got == nil || *got != cid {
+		t.Fatalf("api.%s company_id = %v, want %d", root, got, cid)
+	}
 }

@@ -2,18 +2,30 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
-// maxChatUpload caps a single chat-attachment upload request (memory + spill).
-const maxChatUpload = 128 << 20 // 128 MiB
+const (
+	// maxChatUpload caps the combined file data in one attachment upload.
+	maxChatUpload = 512 << 20 // 512 MiB
+	// Allow multipart headers and boundaries in addition to the file data.
+	chatUploadMultipartOverhead = 1 << 20 // 1 MiB
+	chatUploadLimitMessage      = "files exceed the 512 MiB upload limit"
+	// maxUploadNameTries bounds the name-1, name-2, … search. A Stat error that
+	// is not "not exist" (a component the filesystem rejects) must stop the
+	// search instead of spinning.
+	maxUploadNameTries = 10000
+)
 
 // safeChatID guards the {id} path segment against traversal — task ids are numeric,
 // session ids are alnum/_/- ; anything with "/" or ".." is rejected.
@@ -37,9 +49,9 @@ type chatAttachment struct {
 //
 // POST /api/chat/upload?scope=task|session|staging&id=<id>, multipart field "file"
 // (repeatable). Returns {attachments:[{name,path,size,abs}]}. Target dir mirrors the
-// agent CWD layout:
+// agent CWD layout (the run directory is created like the agent creates it):
 //
-//	scope=task    → <workDir>/tasks/<id>/uploads/
+//	scope=task    → <workDir>/tasks/<id>/main/uploads/   (the main agent's run directory)
 //	scope=session → <workDir>/sessions/<id>/uploads/
 //	scope=staging → <workDir>/drafts/<id>/uploads/   (pre-task staging: the task has no ID yet;
 //	                files land here first and the frontend writes their abs paths into the task description)
@@ -63,8 +75,10 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid id")
 		return
 	}
+	base := filepath.Join(s.m.dir, sub, id) // the directory uploads/ goes in
 	if taskScoped {
-		if s.m.ResolveTask(id) == nil {
+		t := s.m.ResolveTask(id)
+		if t == nil {
 			writeErr(w, 404, "task not found")
 			return
 		}
@@ -73,20 +87,38 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.engine.decInflight(id)
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		base = agent.EnsureRunDir(s.m.dir, taskID, 0)
+	} else if sub == "sessions" {
+		base = agent.EnsureSessionDir(s.m.dir, id)
 	}
-	dir := filepath.Join(s.m.dir, sub, id, "uploads")
+	dir := filepath.Join(base, "uploads")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeErr(w, 500, "failed to create directory: "+err.Error())
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload)
+	r.Body = http.MaxBytesReader(w, r.Body, maxChatUpload+chatUploadMultipartOverhead)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeErr(w, 400, "failed to parse the upload or size limit exceeded: "+err.Error())
+		var sizeErr *http.MaxBytesError
+		if errors.As(err, &sizeErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, chatUploadLimitMessage)
+			return
+		}
+		writeErr(w, 400, "failed to parse the upload: "+err.Error())
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	files := r.MultipartForm.File["file"]
 	if len(files) == 0 {
 		writeErr(w, 400, "missing upload file (form field file)")
+		return
+	}
+	var totalSize int64
+	for _, hdr := range files {
+		totalSize += hdr.Size
+	}
+	if totalSize > maxChatUpload {
+		writeErr(w, http.StatusRequestEntityTooLarge, chatUploadLimitMessage)
 		return
 	}
 	out := make([]chatAttachment, 0, len(files))
@@ -95,7 +127,11 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
 			continue
 		}
-		dest := uniqueUploadPath(dir, name)
+		dest, err := uniqueUploadPath(dir, name)
+		if err != nil {
+			writeErr(w, 500, "Save failed: "+err.Error())
+			return
+		}
 		if err := saveUpload(hdr, dest); err != nil {
 			writeErr(w, 500, "Save failed: "+err.Error())
 			return
@@ -108,19 +144,34 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 
 // uniqueUploadPath returns dir/name, or dir/name-1, dir/name-2… when it already exists,
 // so re-uploading the same filename never clobbers a prior attachment.
-func uniqueUploadPath(dir, name string) string {
-	dest := filepath.Join(dir, name)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
-		return dest
+func uniqueUploadPath(dir, name string) (string, error) {
+	if dest, ok, err := uploadPathFree(filepath.Join(dir, name)); err != nil || ok {
+		return dest, err
 	}
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
-	for i := 1; ; i++ {
+	for i := 1; i <= maxUploadNameTries; i++ {
 		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
-			return cand
+		dest, ok, err := uploadPathFree(cand)
+		if err != nil || ok {
+			return dest, err
 		}
 	}
+	return "", fmt.Errorf("no free name for upload %q", name)
+}
+
+// uploadPathFree reports whether path can be created. ok is false when a file
+// or a symlink (including a dangling one) is already there. Any other Lstat
+// error is returned so the caller stops.
+func uploadPathFree(path string) (dest string, ok bool, err error) {
+	_, err = os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return "", false, nil
 }
 
 // composeAgentMessage appends an attachment manifest to the user's message so the agent

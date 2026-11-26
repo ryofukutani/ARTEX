@@ -2,11 +2,11 @@ name: Sync upstream
 
 on:
   schedule:
-    - cron: '17 18 * * *'   # 毎日 03:17 JST
+    - cron: '23 * * * *' # 毎時23分に本家と同期
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   sync:
@@ -14,5 +14,6 @@ jobs:
     steps:
       - name: Sync main with BaaRai/ARTEX
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Contents と Workflows の Read/Write 権限を持つ Fine-grained PAT
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: gh repo sync "$GITHUB_REPOSITORY" --source BaaRai/ARTEX --branch main

@@ -276,7 +276,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		})
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools, s.execPriv) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
-		domainReg := buildDomainReg(m.Assets())
+		domainReg := s.buildDomainReg()
 		wireTools(m.pg, domainReg)   // built-in tools table: filter per agent + override description/schema + inject defaults
 		seedPrompts(m.pg)            // seed built-in agent default prompt bodies into agent_prompts (only when empty)
 		warnBrokenSkills(s.skillDir) // surface skills whose frontmatter silently failed to parse
@@ -4583,14 +4583,8 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // pure vulnerabilities (facts are a separate KindFact and never enter the report)
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
-		}
-	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	counts, _ := s.m.Assets().CountsByTypeForTask(taskID)
 	var ledger *db.CoverageLedger
 	if t.CoverageEnabled {
 		ledger, _ = s.m.Assets().CoverageLedger(taskID)

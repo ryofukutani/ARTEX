@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -1602,16 +1603,23 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if !findingTrafficBindingEnabled() {
 			a.TrafficRefs, a.EvidenceHintID = nil, nil
 		}
-		// A model routinely emits "evidence_hint_id": 0 meaning "absent" — the field
-		// is optional, so 0 must mean "no hint", not an error. A hint id that does
-		// not resolve to a local hint node (passing a fact node number is the common
-		// case) must not sink an otherwise complete finding either: when explicit
-		// traffic_refs are present they are sufficient on their own, so degrade to
-		// them and keep the finding. Only a call with neither usable hint nor usable
-		// refs fails.
-		refs, err := t.findingRefsFromHint(pid(a.EvidenceHintID), a.TrafficRefs)
+		// A model routinely emits "evidence_hint_id": 0 (or null/"") meaning "absent",
+		// or passes a stale/non-hint node ID. Because evidence_hint_id is optional and
+		// findings without bound traffic are valid (the report agent binds traffic later),
+		// a stale or non-local hint ID must degrade cleanly to whatever valid explicit
+		// traffic_refs were passed (including none) instead of discarding the finding (#550).
+		hintID := pid(a.EvidenceHintID)
+		var ignoredHintNote string
+		refs, err := t.findingRefsFromHint(hintID, a.TrafficRefs)
 		if err != nil {
-			if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
+			if errors.Is(err, errEvidenceHintNotFound) {
+				degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs)
+				if derr != nil {
+					return actool.Errorf(derr.Error()), nil
+				}
+				refs = degraded
+				ignoredHintNote = fmt.Sprintf("Ignored stale or non-local evidence_hint_id=%d; finding recorded without hint references.", hintID)
+			} else if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
 				refs = degraded
 			} else {
 				return actool.Errorf(err.Error()), nil
@@ -1630,6 +1638,20 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		// retry hits the same check and is suppressed again.
 		if a.ForceRegister {
 			slog.Info("[triage] override: force_register set, registering without duplicate check", "candidate", a.Name)
+		} else if dup, ok := t.fingerprintDuplicate(input); ok {
+			res := map[string]any{
+				"duplicate_of_finding_id":      dup.FindingID,
+				"duplicate_of_finding_node_id": dup.NodeID,
+				"dedup_source":                 "fingerprint",
+				"fingerprint":                  dup.Fingerprint,
+				"evidence_status":              "duplicate_not_registered",
+				"note": fmt.Sprintf("Deterministic fingerprint (%s) matched already registered finding_id %d (exploration node %d), so no new finding was created. "+
+					"To extend that finding with new evidence, call update_finding_report with finding_id=%d (it addresses the NODE id, not the findings-table id). "+
+					"If the new evidence is in fact a distinct defect (different endpoint, parameter or root cause), call report_finding again with force_register=true.",
+					dup.Fingerprint, dup.FindingID, dup.NodeID, dup.NodeID),
+			}
+			raw, _ := json.Marshal(res)
+			return actool.Text(fmt.Sprintf("finding matched existing finding_id %d (node %d, fingerprint %s) — not registered again\n%s", dup.FindingID, dup.NodeID, dup.Fingerprint, raw)), nil
 		} else if ans, ok := t.triageDuplicate(ctx, input); ok && triageDuplicateHit(ans) {
 			res := map[string]any{
 				"duplicate_of_finding_id":      ans.DuplicateOf,
@@ -1680,6 +1702,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			result.EvidenceNote = "Finding saved without bound traffic (recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset is bound). Bind verified HTTP traffic via bind_finding_traffic or the findings page; for non-HTTP goals, prove the goal with an observed tool_output fact. Do not create the finding again."
 			if !findingTrafficBindingEnabled() {
 				result.EvidenceNote = "Finding saved without bound traffic. Automatic agent traffic binding is off: this finding remains visible but cannot close a goal unless traffic is bound manually later (or a non-HTTP goal is proven with an observed tool_output fact)."
+			}
+		}
+		if ignoredHintNote != "" {
+			if result.EvidenceNote != "" {
+				result.EvidenceNote = ignoredHintNote + " " + result.EvidenceNote
+			} else {
+				result.EvidenceNote = ignoredHintNote
 			}
 		}
 		raw, _ := json.Marshal(result)

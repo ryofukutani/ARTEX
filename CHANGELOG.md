@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Tampering-hook tests run in CI**: the `web` job now runs `npm run test:tamper-hooks`. The suite existed as a script but no workflow called it, so a regression in the tampering-hook editor's payload and validation handling could merge without failing a check.
 - **Preinstalled Python packages for agent scripts**: `requests`, `beautifulsoup4`, `lxml`, `urllib3`, `pyyaml`, `jinja2`, `colorama` and `tqdm` are preinstalled in the runtime image with pinned versions so agent-generated scripts run without runtime pip downloads.
 
 - **Pentest knowledge pack**: the planner and the workers can call a read-only `knowledge_lookup` tool to resolve a MITRE ATT&CK technique, an OWASP WSTG test or a CWE weakness by id or keyword, and cite the id in findings and facts. The pack is generated from the official sources by `scripts/knowledge/build.py`, with the source URL, license, retrieval date and source SHA-256 recorded, keeps its own licenses in `knowledge/NOTICE` and `knowledge/licenses`, and is embedded in the binary, so no network is needed at runtime. Descriptions are capped and each entry carries the canonical URL (#521).
@@ -18,6 +19,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Ollama accepts the Main Agent's tools**: the `summary` pattern in the `record_fact` schema was unanchored, and Ollama refuses the whole request with HTTP 400 ("Pattern must start with '^' and end with '$'") when it turns a schema into a grammar, so the first turn failed. The pattern is now anchored and still means "contains a non-whitespace character", multi-line summaries included. A test fails on any unanchored pattern in the schema. Based on the approach in #599 by @Layfate (#595).
 - **Browser capture keeps a bounded request map**: unfinished debugger requests are capped at 500, and a request that fails to load is dropped instead of waiting for eviction. A stored body longer than 256K JavaScript characters is cut and marked `[truncated by extension]`. That count is UTF-16 code units, not bytes; the server still enforces its byte cap on ingest.
 - **Browser capture keeps a bounded request map**: unfinished debugger requests are capped at 500, and a stored request body is cut at the same 256 KiB limit as ingest.
 - **The capture proxy no longer holds a response while indexing it** (#542): recording wrote the trigram full-text index of each body (up to 4 MiB) before the client got its response, under the recorder's global lock, so a 1 MB script added about 160 ms to its own response and to every response recorded behind it. The index is now written by a background worker. Body searches wait for entries queued before them, so they still find every exchange recorded before the search. An entry whose exchange was deleted in the meantime is dropped.
